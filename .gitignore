@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.divsel_cache/
+*.npy
+*.traj
+*.xyz
+*.extxyz
+*.png
+*.pdf
+.ipynb_checkpoints/
+.venv/
+
+# demo / run outputs
+examples/demo_*.traj
+examples/demo_*.extxyz
+examples/round*/
+examples/for_DFT*.traj
+divsel_out/
+
+# kept local, never published (pre-package originals)
+orginal_code_v1/
+orginal_code_v2/
