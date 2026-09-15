@@ -341,3 +341,22 @@ design (the alternative, `k = n_select + n_seed`, grows without bound across
 rounds), it is logged as a warning, and `run_manifest.json` always records the
 split as `n_from_kmeans` / `n_from_fps_topup`. Raise `--kmeans_k` if you want
 k-means to keep a say.
+
+---
+
+## Citing this work
+
+If `divsel` contributes to work you publish, please cite:
+
+```bibtex
+@ARTICLE{Liu2026-MLIP,
+  title        = {Molecular origins of {CO2} capture behavior in Amine-appended
+                  nanoporous frameworks},
+  author       = {Liu, Liping and Zhou, Zihui and Daglar, Hilal and Siepmann,
+                  Ilja and Yaghi, Omar M and Gagliardi, Laura},
+  journaltitle = {ChemRxiv},
+  date         = {2026-08-10},
+  urldate      = {2026-08-13},
+  language     = {en}
+}
+```
