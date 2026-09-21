@@ -40,6 +40,12 @@ class Featurizer(ABC):
     #: "process_pool" (CPU, forkable) or "in_process_batched" (GPU / torch)
     parallel_mode: str = "process_pool"
 
+    #: Does this backend read coordinates at all?  False for a table backend
+    #: that only looks vectors up by provenance, which lets the caller skip
+    #: boxing -- putting a molecule in a box is pure waste when the geometry is
+    #: never touched, and the vacuum guard is meaningless for it.
+    needs_geometry: bool = True
+
     @abstractmethod
     def prepare(self, frame_index: Any) -> None:
         """Hook called once after the scan, before any featurization.
@@ -94,6 +100,30 @@ class Featurizer(ABC):
         """Return None if the structure can be featurized, else a reason string.
 
         The reason is recorded per frame in ``frames.csv``; the caller decides
-        whether to skip or raise.
+        whether to skip or raise.  This is about the *structure* -- an element
+        the descriptor is not defined for.
+        """
+        return None
+
+    def inherited_status(self, atoms: Atoms) -> str | None:
+        """A skip this structure already received upstream, or None.
+
+        Only meaningful for a backend serving someone else's features. Reusing
+        a previous run's descriptors must reproduce that run's frame set,
+        including the frames it dropped -- re-litigating the decision here
+        would select over a different set than the vectors describe. The
+        status is recorded verbatim in ``frames.csv``, so the original reason
+        survives into the new run, and no policy flag gates it.
+        """
+        return None
+
+    def check_available(self, atoms: Atoms) -> str | None:
+        """Return None if a feature vector exists for this structure.
+
+        Separate from :meth:`check_supported` because the two failures are
+        different things and deserve different messages: `check_supported` says
+        the structure is out of the descriptor's domain, this says the backend
+        has no vector to hand back for it.  Only a table backend can fail here;
+        anything that computes features answers None.
         """
         return None

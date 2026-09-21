@@ -263,8 +263,14 @@ def _build_setup(
     normalize: str,
     selected_images: Sequence[str],
     on_small_vacuum: str = "error",
+    on_invalid_features: str = "error",
+    input_features: str | Path | None = None,
+    feature_group: str | None = None,
     cache_root: str | Path | None = None,
 ) -> dict:
+    if input_features is not None:
+        # Precomputed vectors: the SOAP settings are inert from here on.
+        featurizer = "table"
     if featurizer not in IMPLEMENTED:
         # Fail before the scan, not after it: a clear message beats a crash
         # twenty minutes into a run.
@@ -299,7 +305,15 @@ def _build_setup(
 
     # Constructed before the scan so the boxing probe can read its cutoff;
     # prepare() still runs afterwards, once the species union is known.
-    featurizer_obj = get_featurizer(featurizer, cfg=soap_cfg)
+    if input_features is not None:
+        featurizer_obj = get_featurizer(
+            "table", source=input_features, feature_group=feature_group
+        )
+        # The species union only exists to size a SOAP descriptor; the table's
+        # width is already fixed, so scanning for it would be wasted reading.
+        need_species = False
+    else:
+        featurizer_obj = get_featurizer(featurizer, cfg=soap_cfg)
     _probe_boxing_requirement(
         patterns, box_cfg, featurizer_obj.neighbor_cutoff, on_small_vacuum
     )
@@ -315,8 +329,17 @@ def _build_setup(
 
     featurizer_obj.prepare(frame_index)
 
+    # Fail now, naming every frame the table cannot serve, rather than part way
+    # through the first batch.
+    check_coverage = getattr(featurizer_obj, "check_coverage", None)
+    if check_coverage is not None:
+        check_coverage(frame_index, on_invalid=on_invalid_features)
+
     fields = dict(featurizer_obj.identity_fields())
-    fields["featurizer"] = featurizer_obj.name
+    # setdefault, not assignment: a table reusing a previous run's descriptors
+    # carries that run's identity, and overwriting `featurizer` here would
+    # change the hash and break `--selected_images` against its own output.
+    fields.setdefault("featurizer", featurizer_obj.name)
     fields["normalize"] = normalize
     did = descriptor_id(fields)
     logger.info(
@@ -442,6 +465,10 @@ def run_describe(
     stream: StreamConfig | None = None,
     normalize: str = "l2",
     on_small_vacuum: str = "error",
+    on_invalid_features: str = "error",
+    input_features: str | Path | None = None,
+    feature_group: str | None = None,
+    save_features: str | Path | None = None,
     argv: list[str] | None = None,
 ) -> dict:
     """Compute and persist descriptors without selecting anything.
@@ -460,6 +487,10 @@ def run_describe(
         stream=stream or StreamConfig(),
         normalize=normalize,
         on_small_vacuum=on_small_vacuum,
+        on_invalid_features=on_invalid_features,
+        input_features=input_features,
+        feature_group=feature_group,
+        save_features=save_features,
         selected_images=(),
         argv=argv,
     )
@@ -478,6 +509,10 @@ def run_selection(
     selected_images: Sequence[str] = (),
     cache_root: str | Path | None = None,
     on_small_vacuum: str = "error",
+    on_invalid_features: str = "error",
+    input_features: str | Path | None = None,
+    feature_group: str | None = None,
+    save_features: str | Path | None = None,
     argv: list[str] | None = None,
 ) -> dict:
     """Describe, select, and write every output.  Returns the manifest dict.
@@ -504,6 +539,10 @@ def run_selection(
         stream=stream or StreamConfig(),
         normalize=select_cfg.normalize,
         on_small_vacuum=on_small_vacuum,
+        on_invalid_features=on_invalid_features,
+        input_features=input_features,
+        feature_group=feature_group,
+        save_features=save_features,
         selected_images=selected_images,
         cache_root=cache_root,
         argv=argv,
@@ -523,6 +562,10 @@ def _run(
     normalize: str,
     selected_images: Sequence[str],
     on_small_vacuum: str = "error",
+    on_invalid_features: str = "error",
+    input_features: str | Path | None = None,
+    feature_group: str | None = None,
+    save_features: str | Path | None = None,
     cache_root: str | Path | None = None,
     argv: list[str] | None = None,
 ) -> dict:
@@ -539,6 +582,9 @@ def _run(
         normalize=normalize,
         selected_images=selected_images,
         on_small_vacuum=on_small_vacuum,
+        on_invalid_features=on_invalid_features,
+        input_features=input_features,
+        feature_group=feature_group,
         cache_root=cache_root,
     )
     frame_index = setup["frame_index"]
@@ -553,6 +599,26 @@ def _run(
         raise DivselError("no frames to process after stride/max_frames")
 
     batch_size = stream.batch_size
+    if input_features is not None and batch_size > 0:
+        # Streaming exists to bound the cost of *generating* descriptors. With
+        # them already computed, batching buys no memory -- the table is
+        # resident either way -- and costs accuracy, because pooled multi-batch
+        # FPS carries no approximation bound while a single batch is exact.
+        default_batch = StreamConfig.__dataclass_fields__["batch_size"].default
+        if batch_size != default_batch:
+            logger.warning(
+                "ignoring --batch_size %d: with --input_features there is "
+                "nothing to stream (the feature table is already in RAM) and "
+                "batching would make the selection an unbounded approximation. "
+                "Selecting in a single batch instead.",
+                batch_size,
+            )
+        else:
+            logger.info(
+                "precomputed features: selecting in a single batch (exact, "
+                "un-pooled); streaming would only cost accuracy here"
+            )
+        batch_size = 0
     n_batches = frame_index.n_batches(batch_size)
     n_select = select_cfg.n_select if select_cfg else 0
     pool_cap = stream.resolved_pool_cap(n_select) if select_cfg else 0
@@ -597,6 +663,7 @@ def _run(
                 chunk_size=_CHUNK_SIZE,
                 on_unknown_species=soap_cfg.on_unknown_species,
                 on_small_vacuum=on_small_vacuum,
+                on_invalid_features=on_invalid_features,
                 pool=pool,
             )
             store.append(Xb, meta)
@@ -670,6 +737,11 @@ def _run(
         )
     logger.info("described %d row(s) -> %s", n_rows, out_dir / "descriptors.npy")
 
+    if save_features is not None:
+        from .featurizers.table import export_table
+
+        export_table(out_dir, save_features)
+
     manifest: dict[str, Any] = {
         "schema_version": manifest_mod.SCHEMA_VERSION,
         "run": run,
@@ -690,6 +762,11 @@ def _run(
             "n_before_stride": frame_index.n_before_stride,
             "n_after_stride": n_frames,
             "n_described": int(n_rows),
+        },
+        "features": {
+            "source": str(input_features) if input_features is not None else None,
+            "feature_group": feature_group,
+            "on_invalid_features": on_invalid_features,
         },
         "seed_set": {
             "sources": [s.path for s in setup["selected_sources"]],

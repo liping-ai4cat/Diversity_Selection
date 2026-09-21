@@ -39,8 +39,9 @@ from ase import Atoms
 
 from .box import ensure_cell
 from .config import BoxConfig
-from .errors import SpeciesError, VacuumTooSmallError
+from .errors import FeatureTableError, SpeciesError, VacuumTooSmallError
 from .featurizers import Featurizer, featurizer_from_spec
+from .featurizers.table import SRC_INFO_KEY
 from .frames import FrameIndex, FrameRef
 from .log import get_logger
 
@@ -94,6 +95,7 @@ def _prepare_frames(
     box_cfg: BoxConfig,
     on_unknown_species: str,
     on_small_vacuum: str = "error",
+    on_invalid_features: str = "error",
 ) -> tuple[list[tuple[int, Atoms]], list[dict]]:
     """Read, box and screen a batch.  Returns (tasks, per-ref metadata).
 
@@ -106,6 +108,9 @@ def _prepare_frames(
     # Only structures that actually get boxed are held to 2*vacuum >= cutoff;
     # ensure_cell decides that per structure, we just supply the cutoff.
     cutoff = featurizer.neighbor_cutoff
+    # A table backend looks vectors up by provenance and never touches
+    # coordinates, so building a box for it would be pure waste.
+    needs_geometry = getattr(featurizer, "needs_geometry", True)
 
     for slot, atoms in frame_index.iter_slots(refs):
         ref = refs[slot]
@@ -122,28 +127,36 @@ def _prepare_frames(
             f"{record['source_file']} frame {ref.frame_index} "
             f"({record['formula']})"
         )
-        try:
-            boxed, cell_mode = ensure_cell(
-                atoms, box_cfg, cutoff=cutoff, where=where
-            )
-        except VacuumTooSmallError:
-            # A configuration error, not a property of this frame: every
-            # structure needing a box hits it. Abort unless told otherwise.
-            if on_small_vacuum == "error":
-                raise
-            record["status"] = (
-                f"small_vacuum:2*vac={2 * box_cfg.vacuum:g}<cutoff={cutoff:g}"
-            )
-            meta[slot] = record
-            continue
-        except Exception as exc:  # a broken cell is a per-frame problem
-            # Broad on purpose -- one corrupt frame must not kill a long run --
-            # but say so, or a systematic fault looks like a clean run that
-            # happened to describe nothing.
-            logger.warning("could not build a cell for %s: %s", where, exc)
-            record["status"] = f"box_error:{exc}"
-            meta[slot] = record
-            continue
+        # Stamp provenance before anything else looks at the structure: the
+        # table backend joins on it, and it is the same string gather.py writes
+        # into selected.traj, so a seed frame and a candidate frame key alike.
+        atoms.info[SRC_INFO_KEY] = f"{record['source_file']}:{ref.frame_index}"
+
+        if not needs_geometry:
+            boxed, cell_mode = atoms, "native"
+        else:
+            try:
+                boxed, cell_mode = ensure_cell(
+                    atoms, box_cfg, cutoff=cutoff, where=where
+                )
+            except VacuumTooSmallError:
+                # A configuration error, not a property of this frame: every
+                # structure needing a box hits it. Abort unless told otherwise.
+                if on_small_vacuum == "error":
+                    raise
+                record["status"] = (
+                    f"small_vacuum:2*vac={2 * box_cfg.vacuum:g}<cutoff={cutoff:g}"
+                )
+                meta[slot] = record
+                continue
+            except Exception as exc:  # a broken cell is a per-frame problem
+                # Broad on purpose -- one corrupt frame must not kill a long
+                # run -- but say so, or a systematic fault looks like a clean
+                # run that happened to describe nothing.
+                logger.warning("could not build a cell for %s: %s", where, exc)
+                record["status"] = f"box_error:{exc}"
+                meta[slot] = record
+                continue
         record["cell_mode"] = cell_mode
 
         reason = featurizer.check_supported(boxed)
@@ -156,6 +169,30 @@ def _prepare_frames(
                     "--on_unknown_species skip to record and skip such frames."
                 )
             record["status"] = f"skipped_species:{reason.split(':', 1)[-1]}"
+            meta[slot] = record
+            continue
+
+        # A frame the upstream run already dropped keeps that verdict and its
+        # original reason; no policy flag applies, because reopening the
+        # decision would select over a different set than the vectors cover.
+        inherited = featurizer.inherited_status(boxed)
+        if inherited is not None:
+            record["status"] = inherited
+            meta[slot] = record
+            continue
+
+        # Distinct from check_supported: the structure is fine, the backend
+        # just has no vector for it. Only a table backend can answer here.
+        unavailable = featurizer.check_available(boxed)
+        if unavailable is not None:
+            if on_invalid_features == "error":
+                raise FeatureTableError(
+                    f"{record['source_file']} frame {ref.frame_index} "
+                    f"({record['formula']}): {unavailable}.\n"
+                    "Pass --on_invalid_features skip to record and skip such "
+                    "frames instead of aborting."
+                )
+            record["status"] = f"invalid_features:{unavailable}"
             meta[slot] = record
             continue
 
@@ -178,6 +215,7 @@ def describe_batch(
     chunk_size: int = 8,
     on_unknown_species: str = "error",
     on_small_vacuum: str = "error",
+    on_invalid_features: str = "error",
     pool: Any = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Featurize one batch of frames.
@@ -187,7 +225,13 @@ def describe_batch(
     ``X`` (or -1 when the frame was skipped).
     """
     ready, meta = _prepare_frames(
-        refs, frame_index, featurizer, box_cfg, on_unknown_species, on_small_vacuum
+        refs,
+        frame_index,
+        featurizer,
+        box_cfg,
+        on_unknown_species,
+        on_small_vacuum,
+        on_invalid_features,
     )
     d = featurizer.feature_dim
     X = np.empty((len(ready), d), dtype=np.float32)
@@ -258,19 +302,34 @@ def describe_atoms_list(
     kept: list[Atoms] = []
     statuses: list[str] = []
     cutoff = featurizer.neighbor_cutoff
+    needs_geometry = getattr(featurizer, "needs_geometry", True)
     for i, atoms in enumerate(atoms_list):
-        boxed, _ = ensure_cell(
-            atoms,
-            box_cfg,
-            cutoff=cutoff,
-            where=f"seed structure {i} ({atoms.get_chemical_formula(mode='hill')})",
-        )
+        where = f"seed structure {i} ({atoms.get_chemical_formula(mode='hill')})"
+        if needs_geometry:
+            boxed, _ = ensure_cell(atoms, box_cfg, cutoff=cutoff, where=where)
+        else:
+            boxed = atoms
         reason = featurizer.check_supported(boxed)
         if reason is not None:
             if on_unknown_species == "error":
                 raise SpeciesError(f"seed structure {atoms.get_chemical_formula()}: {reason}")
             statuses.append(reason)
             continue
+
+        # A seed the backend cannot serve is always fatal, whatever the
+        # candidate policy says. Silently dropping one would quietly weaken the
+        # constraint that previously-selected structures are never re-picked.
+        unavailable = featurizer.check_available(boxed)
+        if unavailable is not None:
+            raise FeatureTableError(
+                f"{where}: {unavailable}.\n"
+                f"Seed structures are matched to feature rows by "
+                f"atoms.info['{SRC_INFO_KEY}'] = "
+                f"{atoms.info.get(SRC_INFO_KEY, '<missing>')!r}. Extract "
+                "features over the frames these seeds came from, so the table "
+                "covers the candidates and the seed set alike."
+            )
+
         statuses.append("ok")
         kept.append(boxed)
 

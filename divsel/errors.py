@@ -44,5 +44,15 @@ class VacuumTooSmallError(BoxError):
     """
 
 
+class FeatureTableError(DivselError):
+    """A precomputed feature table cannot be used for this run.
+
+    Covers every way ``--input_features`` can fail to line up with the frames
+    being selected: a frame with no row, an ambiguous join, a row marked
+    invalid.  Deliberately distinct from :class:`SpeciesError` -- that is a
+    property of a structure, this is a property of the table.
+    """
+
+
 class ScanError(DivselError):
     """Input files could not be enumerated or indexed."""

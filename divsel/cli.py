@@ -19,10 +19,40 @@ import sys
 from typing import Sequence
 
 from . import __version__
-from .log import setup_logging
+from .log import get_logger, setup_logging
+
+logger = get_logger(__name__)
+
+#: flags that only mean something when divsel generates the descriptors itself
+_SOAP_ONLY_FLAGS = (
+    "--species", "--r_cut", "--n_max", "--l_max", "--sigma", "--rbf",
+    "--soap_average", "--on_unknown_species", "--featurizer",
+)
 
 _METHODS = ("kmeans", "fps")
 _FEATURIZERS = ("soap", "uma", "mace")
+
+
+def _warn_ignored_soap_flags(args, argv: Sequence[str] | None) -> None:
+    """Say so when --input_features makes a SOAP flag inert.
+
+    Read from argv rather than compared against defaults: passing
+    ``--r_cut 6.0`` explicitly is indistinguishable from not passing it if you
+    only look at the parsed value, and silently ignoring a flag the user typed
+    is how people conclude a tool is broken.
+    """
+    if getattr(args, "input_features", None) is None:
+        return
+    typed = [
+        f for f in _SOAP_ONLY_FLAGS
+        if any(a == f or a.startswith(f + "=") for a in (argv or []))
+    ]
+    if typed:
+        logger.warning(
+            "ignoring %s: --input_features supplies the vectors, so nothing "
+            "generates a descriptor this run",
+            ", ".join(typed),
+        )
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -55,6 +85,39 @@ def _add_featurizer(p: argparse.ArgumentParser) -> None:
         default="soap",
         help="descriptor backend (default: %(default)s). uma/mace are registered "
         "placeholders and are not implemented yet.",
+    )
+    g.add_argument(
+        "--input_features",
+        default=None,
+        metavar="PATH",
+        help="use precomputed feature vectors instead of generating SOAP. "
+        "Accepts a latent_features .npz (its .index.csv must sit beside it), "
+        "the bare prefix, or a directory written by a previous `divsel "
+        "select`/`describe`, which reuses that run's SOAP. Rows are matched to "
+        "frames by <file>:<frame>, never by position.",
+    )
+    g.add_argument(
+        "--feature_group",
+        default=None,
+        metavar="LABEL",
+        help="which group_label to take when the table has more than one row "
+        "per structure (latent_features surface/per_atom modes)",
+    )
+    g.add_argument(
+        "--on_invalid_features",
+        default="error",
+        choices=("error", "skip"),
+        help="a row marked valid=False is an all-NaN vector, which would "
+        "corrupt every distance. Default aborts; 'skip' records the frame in "
+        "frames.csv and drops it.",
+    )
+    g.add_argument(
+        "--save_features",
+        default=None,
+        metavar="PATH.npz",
+        help="also write this run's descriptors in the interchange format "
+        "(features/valid + a .index.csv), so they can be fed back through "
+        "--input_features or read by anything that reads latent_features output",
     )
     s = p.add_argument_group("soap")
     s.add_argument(
@@ -288,6 +351,7 @@ def _configs(args):
 def _cmd_describe(args, argv) -> int:
     from .streaming import run_describe
 
+    _warn_ignored_soap_flags(args, argv)
     soap, box, sampling, stream = _configs(args)
     run_describe(
         args.traj,
@@ -299,6 +363,10 @@ def _cmd_describe(args, argv) -> int:
         stream=stream,
         normalize=args.normalize,
         on_small_vacuum=args.on_small_vacuum,
+        on_invalid_features=args.on_invalid_features,
+        input_features=args.input_features,
+        feature_group=args.feature_group,
+        save_features=args.save_features,
         argv=argv,
     )
     return 0
@@ -308,6 +376,7 @@ def _cmd_select(args, argv) -> int:
     from .config import SelectConfig
     from .streaming import run_selection
 
+    _warn_ignored_soap_flags(args, argv)
     soap, box, sampling, stream = _configs(args)
     kmeans_k = args.kmeans_k if args.kmeans_k == "auto" else int(args.kmeans_k)
     select = SelectConfig(
@@ -337,6 +406,10 @@ def _cmd_select(args, argv) -> int:
         selected_images=args.selected_images,
         cache_root=args.cache_root,
         on_small_vacuum=args.on_small_vacuum,
+        on_invalid_features=args.on_invalid_features,
+        input_features=args.input_features,
+        feature_group=args.feature_group,
+        save_features=args.save_features,
         argv=argv,
     )
     if args.plot:

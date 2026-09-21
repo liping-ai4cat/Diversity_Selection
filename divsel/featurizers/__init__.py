@@ -27,6 +27,12 @@ def _load_uma() -> type[Featurizer]:
     return UMAFeaturizer
 
 
+def _load_table() -> type[Featurizer]:
+    from .table import TableFeaturizer
+
+    return TableFeaturizer
+
+
 def _load_mace() -> type[Featurizer]:
     from .mace import MACEFeaturizer
 
@@ -35,12 +41,14 @@ def _load_mace() -> type[Featurizer]:
 
 _REGISTRY: dict[str, Callable[[], type[Featurizer]]] = {
     "soap": _load_soap,
+    "table": _load_table,
     "uma": _load_uma,
     "mace": _load_mace,
 }
 
-#: backends that actually compute something today
-IMPLEMENTED = ("soap",)
+#: backends that actually produce vectors today. "table" serves precomputed
+#: ones rather than computing them, but it is every bit as usable.
+IMPLEMENTED = ("soap", "table")
 
 
 def available() -> list[str]:

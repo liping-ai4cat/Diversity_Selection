@@ -1,13 +1,20 @@
 # divsel
 
-Pick a diverse subset of atomic structures using SOAP descriptors and either
-**k-means** or **farthest-point sampling (FPS)** — with streaming for datasets
+Pick a diverse subset of atomic structures by **k-means** or **farthest-point
+sampling (FPS)** — on SOAP descriptors it generates for you, or on feature
+vectors you already have (MLIP latents, anything). With streaming for datasets
 that do not fit in memory, and a **seed set** so you can continue across
 active-learning rounds without ever re-selecting what you already have.
 
 ```bash
 pip install -e .
+
+# generate SOAP and select
 divsel select --traj 'md/*.traj' --n_select 200 --out round1
+
+# or select on precomputed vectors, skipping SOAP entirely
+divsel select --traj 'md/*.traj' --n_select 200 --out round1 \
+              --input_features uma_features.npz
 ```
 
 ---
@@ -202,6 +209,113 @@ all meaningless by construction; the figure says so in its caption.
 
 ---
 
+---
+
+## Using your own features
+
+SOAP is one way to get vectors; it is not the only one. `--input_features`
+skips descriptor generation entirely and selects on a table you supply:
+
+```bash
+divsel select --traj 'md/*.traj' --n_select 200 --out round1 \
+              --input_features xxx.npz
+```
+
+It accepts either:
+
+* **a `latent_features` output set** — `xxx.npz` (or the bare prefix) with its
+  `.index.csv` beside it, as written by
+  [`latent_spaces_as_features`](https://github.com/liping-ai4cat/latent_spaces_as_features);
+* **a previous divsel output directory** — `--input_features round1`, which
+  reuses that run's `descriptors.npy` instead of recomputing identical SOAP.
+  On the demo set that turns 21.5 s into 4.9 s and selects the *same frames*.
+
+The npz contract, verified against `latent_features/io.py:492`:
+
+| key | shape | meaning |
+|---|---|---|
+| `features` | `(N_rows, D)` | one pooled vector per (structure, group) |
+| `valid` | `(N_rows,)` bool | `False` means that row is all-NaN |
+
+### Keep `<prefix>.metadata.json` with the `.npz`
+
+Only `.npz` + `.index.csv` are *required*, but the metadata sidecar is what
+tells divsel **which model produced these vectors**. It becomes the descriptor
+identity: `backend`, `model_id`, `task_name`, `mode`, `layer_spans`.
+
+Without it those fields are `None`, and two unrelated 128-dim embeddings hash
+to the same `descriptor_id` — so the cross-round guard can no longer tell them
+apart. divsel warns when the file is absent.
+
+It also changes the id, which bites in a specific way. Run round 1 without the
+sidecar, copy it in, then seed round 2 from round 1:
+
+```
+DescriptorMismatchError: seed descriptors are not comparable to this run.
+  seed  (4f6faa3513c3058e):      model_id = None
+  this  (6450113d20cb1f33):      model_id = 'uma-s-1p1'
+```
+
+That is the guard working, not a bug — divsel cannot know the two spaces are
+the same. Regenerate the earlier round with the sidecar in place and both
+rounds agree.
+
+### Rows are matched to frames by provenance, never by position
+
+`features[k]` is **not** input frame `k`. `latent_features` drops whole
+structures under `--skip-errors` with no placeholder, and its `surface` /
+`per_atom` modes emit several rows per structure; meanwhile divsel applies
+`--stride`, `--max_frames` and `--shuffle` to its own frame list. So every row
+is keyed `"<basename>:<frame_index>"` from the index CSV and looked up. A
+positional join would look fine until either side dropped one frame, and would
+then pair every later structure with the wrong vector.
+
+Everything that could misalign raises instead:
+
+| situation | what happens |
+|---|---|
+| a frame has no row | abort, naming up to 10 of them |
+| two input files share a basename | abort — the table stores basenames only, so the join is genuinely ambiguous |
+| more than one row per structure | abort listing the `group_label`s; pick one with `--feature_group` |
+| a row has `valid=False` | abort (a NaN would silently corrupt every distance); `--on_invalid_features skip` records and drops it instead |
+| the source run itself skipped a frame | that skip is inherited, with its original reason, so reuse reproduces the same frame set |
+
+### Interaction with the rest
+
+**`--selected_images` works unchanged.** Seed frames are resolved against the
+same table via `atoms.info["divsel_src"]`, which `selected.traj` already
+carries. No second flag, as long as your features cover the frames the seeds
+came from; if one is missing the run aborts naming it. The descriptor-identity
+guard still applies, so seeding a UMA-featured round with a SOAP-produced
+`selected.traj` raises `DescriptorMismatchError` rather than mixing two
+incomparable spaces.
+
+**Streaming switches itself off.** Batching exists to bound the cost of
+*generating* descriptors. With them precomputed it saves no memory — the table
+is resident either way — and costs accuracy, since pooled multi-batch FPS has
+no approximation bound while a single batch is exact. `--input_features`
+therefore selects in one batch, and warns if you passed `--batch_size` anyway.
+Note an `.npz` is a zip and cannot be memory-mapped, so a very large table
+loads in full; `--stride` / `--max_frames` remain the way to subset it.
+
+### A real example
+
+[`test/select_rhea4sqs.py`](test/select_rhea4sqs.py) selects from 6,545
+relaxed RHEA4SQS structures on their 128-dim UMA `omat` latents — **8.4 s**,
+no SOAP. It is worth reading as a template: it preflights the table, runs the
+selection, then *independently* re-derives the row↔frame mapping from the index
+CSV and asserts every picked structure carries the vector its index entry
+points at (worst |Δ| 5.3e-08, float32 rounding from the L2 normalization).
+
+Round 2 seeded by round 1 picks 200 more with **zero** overlap.
+
+**`--save_features out.npz`** writes this run's descriptors in the same
+interchange format (`features`/`valid` + `.index.csv`), for handing to other
+tools. For plain round-to-round reuse you do not need it — point
+`--input_features` at the previous output directory.
+
+---
+
 ## Options
 
 ```
@@ -209,6 +323,11 @@ divsel select --traj GLOB [GLOB ...] --n_select N [--out DIR]
 
   method     --method kmeans|fps          (default kmeans)
   features   --featurizer soap|uma|mace   (default soap; uma/mace not implemented)
+             --input_features PATH        precomputed vectors: a latent_features
+                                          .npz/prefix, or a previous --out dir
+             --feature_group LABEL        when the table has >1 row per structure
+             --on_invalid_features error|skip
+             --save_features PATH.npz     export this run's descriptors
   seed       --selected_images FILE [FILE ...]   (trajectories selected in
                                                   previous rounds; must share
                                                   descriptor parameters)
@@ -273,6 +392,18 @@ print(manifest["results"]["coverage_radius_min_d2"])
 `out_dir` is a directory, not a filename: `"round2"` is right and
 `"round2.traj"` would create a *directory* by that name. The one output path
 that is a file is `divsel gather --out_traj for_DFT.traj`.
+
+To select on features you already have, pass `input_features` instead of a
+`soap_cfg` — everything else is the same:
+
+```python
+manifest = run_selection(
+    ["RHEA4SQS_relaxed_omat.traj"],
+    out_dir="round1",
+    select_cfg=SelectConfig(n_select=200, method="fps"),
+    input_features="RHEA4SQS_relaxed_omat",   # prefix, .npz, or a previous out_dir
+)
+```
 
 `selected_images` accepts any number of previously-selected trajectories, and
 every one of them must have been described with the same parameters. That is
