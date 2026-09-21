@@ -24,3 +24,6 @@ divsel_out/
 # kept local, never published (pre-package originals)
 orginal_code_v1/
 orginal_code_v2/
+
+# unpublished results -- data and selections, never published
+test/
