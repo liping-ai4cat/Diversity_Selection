@@ -439,8 +439,7 @@ requirement.
 
 ## What changed from the original scripts
 
-The previous two-script workflow lives untouched in `orginal_code_v1/` and
-`orginal_code_v2/`. The substantive differences:
+The previous two-script workflow in the ChemRixv Paper bellow. The substantive differences:
 
 * **Frame provenance is real.** The old descriptor CSV was written from
   `imap_unordered` in *completion* order with the frame index discarded, and
